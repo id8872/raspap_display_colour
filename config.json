@@ -1,0 +1,41 @@
+{
+  "known_wifi_networks": {
+    "Home WiFi": "(OvO)",
+    "Phone Hotspot": "BitNet"
+  },
+  "vpn_profiles": [
+    {
+      "name": "ca1651.nordvpn.com.tcp_client.conf",
+      "display_name": "Canada",
+      "file": "ca1651.nordvpn.com.tcp.ovpn"
+    },
+    {
+      "name": "us6267.nordvpn.com.tcp_client.conf",
+      "display_name": "USA",
+      "file": "us6267.nordvpn.com.tcp.ovpn"
+    },
+    {
+      "name": "nz94.nordvpn.com.tcp_client.conf",
+      "display_name": "New Zealand",
+      "file": "nz94.nordvpn.com.tcp.ovpn"
+    }
+  ],
+  "update_interval": 10,
+  "geoip_interval": 450,
+  "default_screen": "main",
+  "theme": {
+    "primary_color": "#DB3458",
+    "accent_color": "#2ECC71",
+    "background_color": "#ECF0F1",
+    "text_light": "#FFFFFF",
+    "text_dark": "#2C3E50",
+    "button_normal": "#34495E",
+    "button_pressed": "#2C3E50"
+  },
+  "fonts": {
+    "title": "42sp",
+    "header": "26sp",
+    "normal": "22sp",
+    "small": "16sp"
+  }
+}
