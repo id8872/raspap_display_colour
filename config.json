@@ -1,7 +1,7 @@
 {
   "known_wifi_networks": {
-    "Home WiFi": "(OvO)",
-    "Phone Hotspot": "BitNet"
+    "Home WiFi": "Home_WIFI",
+    "Phone Hotspot": "Phone_WIFI"
   },
   "vpn_profiles": [
     {
