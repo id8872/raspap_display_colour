@@ -68,7 +68,9 @@ CONFIG = {}
 DEFAULT_CONFIG = {
     "update_interval": 2,
     "default_screen": "main",
-    "geoip_interval": 300,  # seconds; periodic GeoIP refresh
+    "geoip_interval": 300,           # seconds; periodic GeoIP refresh
+    "vpn_connect_timeout": 40,       # seconds; wait for tun/tap+IP when connecting
+    "vpn_disconnect_timeout": 15,    # seconds; wait for teardown when disconnecting
     "theme": {
         "primary_color": "#3498DB", "accent_color": "#2ECC71",
         "background_color": "#ECF0F1", "text_light": "#FFFFFF",
@@ -340,6 +342,12 @@ def parse_hostapd_conf():
 # ------------------------------------------------------------
 def has_cmd(name: str) -> bool:
     return shutil.which(name) is not None
+
+def is_ookla_speedtest() -> bool:
+    if not has_cmd("speedtest"):
+        return False
+    out = run_cmd(["speedtest", "-V"], timeout=3)
+    return "Ookla" in (out or "")
 
 def dbm_to_percent(dbm: int) -> int:
     if dbm is None:
@@ -639,6 +647,44 @@ class UiState(EventDispatcher):
 STATE = UiState()
 
 
+# ------------- VPN wait helpers -------------
+def _list_tun_tap_ifaces():
+    try:
+        return [n for n in os.listdir('/sys/class/net') if n.startswith('tun') or n.startswith('tap')]
+    except Exception:
+        return []
+
+def _vpn_iface_with_ip():
+    for name in _list_tun_tap_ifaces():
+        ip = UiState._get_ip(name)
+        if ip:
+            return name, ip
+    return None, None
+
+def _is_openvpn_running():
+    return bool(run_cmd(["pgrep", "-x", "openvpn"], timeout=2))
+
+def _wait_for_vpn_up(timeout=40, interval=0.5):
+    start = time.time()
+    while time.time() - start < timeout:
+        iface, ip = _vpn_iface_with_ip()
+        if iface and ip:
+            return iface, ip
+        if not _is_openvpn_running():
+            raise RuntimeError("OpenVPN exited before connection was established")
+        time.sleep(interval)
+    raise RuntimeError("VPN connection timed out")
+
+def _wait_for_vpn_down(timeout=15, interval=0.5):
+    start = time.time()
+    while time.time() - start < timeout:
+        if not _is_openvpn_running() and not _list_tun_tap_ifaces():
+            return True
+        time.sleep(interval)
+    raise RuntimeError("VPN did not stop in time")
+# -------------------------------------------
+
+
 # ------------------------------------------------------------
 # UI widgets
 # ------------------------------------------------------------
@@ -719,7 +765,7 @@ class MainScreen(Screen):
         self.add_widget(overall_layout)
 
         self._bind_state_to_ui()
-        # Removed old one-off geoip refresh; app-level triggers handle it
+        # GeoIP refresh handled at app-level triggers
 
     def _bind_state_to_ui(self):
         def set_value(key, value):
@@ -842,8 +888,7 @@ class InfoScreen(Screen):
         # 3-column grid: Label | Value | Action (button/blank)
         self.grid = GridLayout(cols=3, spacing=(THEME.SPACING, 2), size_hint_y=None, size_hint_x=1)
         self.grid.bind(minimum_height=self.grid.setter('height'))
-        self.grid.row_force_default = True
-        self.grid.row_default_height = 28
+        self.grid.row_force_default = False  # allow per-row heights
 
         self.info_labels = {}
         self.info_key_labels = []
@@ -856,15 +901,20 @@ class InfoScreen(Screen):
             "CPU°", "GeoIP", "VPN Status"
         ]
 
-        # Speed row
-        speed_key_label = Label(text="Speed:", font_size=THEME.FONT_SIZE_NORMAL, color=THEME.TEXT_COLOR_DARK,
-                                halign='left', valign='middle', size_hint_x=None)
+        # Speed row (small font, 2-line layout, taller row)
+        speed_key_label = Label(
+            text="Speed:", font_size=THEME.FONT_SIZE_SMALL, color=THEME.TEXT_COLOR_DARK,
+            halign='left', valign='middle', size_hint_x=None, size_hint_y=None, height=48
+        )
         speed_key_label.bind(size=speed_key_label.setter('text_size'))
-        self.speed_value = Label(text="Tap Test", font_size=THEME.FONT_SIZE_NORMAL, color=THEME.TEXT_COLOR_DARK,
-                                 halign='left', valign='middle', size_hint_x=None)
+
+        self.speed_value = Label(
+            text="Tap Test", font_size=THEME.FONT_SIZE_SMALL, color=THEME.TEXT_COLOR_DARK,
+            halign='left', valign='middle', size_hint_x=None, size_hint_y=None, height=48
+        )
         self.speed_value.bind(size=self.speed_value.setter('text_size'))
 
-        self.speed_btn = ThemedButton(text="Test", size_hint_x=None)
+        self.speed_btn = ThemedButton(text="Test", size_hint_x=None, size_hint_y=None, height=48)
         self.speed_btn.bind(on_release=self.run_speed_test)
 
         self.grid.add_widget(speed_key_label)
@@ -875,18 +925,22 @@ class InfoScreen(Screen):
         self.info_value_labels.append(self.speed_value)
         self.info_action_widgets.append(self.speed_btn)
 
-        # Base rows
+        # Base rows (small font, tight 24px)
         for key in self.info_keys_base:
-            key_label = Label(text=f"{key}:", font_size=THEME.FONT_SIZE_NORMAL, color=THEME.TEXT_COLOR_DARK,
-                              halign='left', valign='middle', size_hint_x=None)
-            value_label = Label(text="...", font_size=THEME.FONT_SIZE_NORMAL, color=THEME.TEXT_COLOR_DARK,
-                                halign='left', valign='middle', size_hint_x=None)
+            key_label = Label(
+                text=f"{key}:", font_size=THEME.FONT_SIZE_SMALL, color=THEME.TEXT_COLOR_DARK,
+                halign='left', valign='middle', size_hint_x=None, size_hint_y=None, height=24
+            )
+            value_label = Label(
+                text="...", font_size=THEME.FONT_SIZE_SMALL, color=THEME.TEXT_COLOR_DARK,
+                halign='left', valign='middle', size_hint_x=None, size_hint_y=None, height=24
+            )
             key_label.bind(size=key_label.setter('text_size'))
             value_label.bind(size=value_label.setter('text_size'))
 
             self.grid.add_widget(key_label)
             self.grid.add_widget(value_label)
-            placeholder = Label(text="", size_hint_x=None)
+            placeholder = Label(text="", size_hint_x=None, size_hint_y=None, height=24)
             self.grid.add_widget(placeholder)
 
             self.info_key_labels.append(key_label)
@@ -984,10 +1038,12 @@ class InfoScreen(Screen):
         show_busy_indicator()
 
         def _task():
-            # 1) Python module
+            errors = []
+
+            # 1) Python module (provided by pip install speedtest-cli)
             try:
-                import speedtest as speedtest_mod
-                st = speedtest_mod.Speedtest(source_address=host_ip)
+                import speedtest as st_mod
+                st = st_mod.Speedtest(source_address=host_ip)
                 st.get_servers()
                 st.get_best_server()
                 down_bps = st.download()
@@ -999,49 +1055,84 @@ class InfoScreen(Screen):
                     except Exception:
                         pass
                 return {"down_bps": down_bps, "up_bps": up_bps, "ping_ms": ping_ms, "src": "py", "iface": host_iface}
+            except ImportError:
+                errors.append("python: module 'speedtest' not installed (pip3 install speedtest-cli)")
             except Exception as e_py:
-                log.debug("Python speedtest module failed: %s", e_py)
+                errors.append(f"python: {e_py}")
 
-            # 2) Ookla CLI
-            try:
-                cp = subprocess.run(
-                    ["speedtest", "--accept-license", "--accept-gdpr", "--ip-protocol=ipv4", "-f", "json", "--interface", host_iface],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
-                )
-                if cp.returncode == 0 and cp.stdout:
-                    data = json.loads(cp.stdout)
-                    down_bps = data.get("download", {}).get("bandwidth")
-                    up_bps = data.get("upload", {}).get("bandwidth")
-                    ping_ms = data.get("ping", {}).get("latency")
-                    if down_bps is not None: down_bps *= 8
-                    if up_bps is not None: up_bps *= 8
-                    return {"down_bps": down_bps, "up_bps": up_bps, "ping_ms": ping_ms, "src": "ookla", "iface": host_iface}
-                else:
-                    log.debug("Ookla CLI failed rc=%s err=%s", cp.returncode, (cp.stderr or "").strip())
-            except Exception as e_ook:
-                log.debug("Ookla CLI speedtest failed: %s", e_ook)
+            # 2) sivel CLI (speedtest-cli)
+            if has_cmd("speedtest-cli"):
+                try:
+                    cp = subprocess.run(
+                        ["speedtest-cli", "--json", "--source", host_ip],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
+                    )
+                    if cp.returncode == 0 and cp.stdout:
+                        data = json.loads(cp.stdout)
+                        return {
+                            "down_bps": data.get("download"),
+                            "up_bps": data.get("upload"),
+                            "ping_ms": data.get("ping"),
+                            "src": "cli",
+                            "iface": host_iface
+                        }
+                    else:
+                        errors.append(f"speedtest-cli: rc={cp.returncode} err={ (cp.stderr or cp.stdout or '').strip() }")
+                        # Retry without binding to source IP
+                        cp2 = subprocess.run(
+                            ["speedtest-cli", "--json"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
+                        )
+                        if cp2.returncode == 0 and cp2.stdout:
+                            data = json.loads(cp2.stdout)
+                            return {
+                                "down_bps": data.get("download"),
+                                "up_bps": data.get("upload"),
+                                "ping_ms": data.get("ping"),
+                                "src": "cli*",
+                                "iface": host_iface
+                            }
+                        else:
+                            errors.append(f"speedtest-cli(no-source): rc={cp2.returncode} err={ (cp2.stderr or cp2.stdout or '').strip() }")
+                except Exception as e_cli:
+                    errors.append(f"speedtest-cli: {e_cli}")
+            else:
+                errors.append("speedtest-cli: not installed")
 
-            # 3) speedtest-cli
-            try:
-                cp = subprocess.run(
-                    ["speedtest-cli", "--json", "--source", host_ip],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120
-                )
-                if cp.returncode == 0 and cp.stdout:
-                    data = json.loads(cp.stdout)
-                    return {
-                        "down_bps": data.get("download"),
-                        "up_bps": data.get("upload"),
-                        "ping_ms": data.get("ping"),
-                        "src": "cli",
-                        "iface": host_iface
-                    }
-                else:
-                    log.debug("speedtest-cli failed rc=%s err=%s", cp.returncode, (cp.stderr or "").strip())
-            except Exception as e_cli:
-                log.debug("speedtest-cli failed: %s", e_cli)
+            # 3) Ookla CLI (speedtest)
+            if is_ookla_speedtest():
+                try:
+                    cmd = ["speedtest", "--accept-license", "--accept-gdpr", "--ip-protocol=ipv4", "-f", "json", "--interface", host_iface]
+                    cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                    if cp.returncode == 0 and cp.stdout:
+                        data = json.loads(cp.stdout)
+                        down_bps = data.get("download", {}).get("bandwidth")
+                        up_bps = data.get("upload", {}).get("bandwidth")
+                        ping_ms = data.get("ping", {}).get("latency")
+                        if down_bps is not None: down_bps *= 8  # bytes/s -> bits/s
+                        if up_bps is not None: up_bps *= 8
+                        return {"down_bps": down_bps, "up_bps": up_bps, "ping_ms": ping_ms, "src": "ookla", "iface": host_iface}
+                    else:
+                        errors.append(f"ookla(iface): rc={cp.returncode} err={ (cp.stderr or cp.stdout or '').strip() }")
+                        # Retry without interface pinning
+                        cmd2 = ["speedtest", "--accept-license", "--accept-gdpr", "--ip-protocol=ipv4", "-f", "json"]
+                        cp2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                        if cp2.returncode == 0 and cp2.stdout:
+                            data = json.loads(cp2.stdout)
+                            down_bps = data.get("download", {}).get("bandwidth")
+                            up_bps = data.get("upload", {}).get("bandwidth")
+                            ping_ms = data.get("ping", {}).get("latency")
+                            if down_bps is not None: down_bps *= 8
+                            if up_bps is not None: up_bps *= 8
+                            return {"down_bps": down_bps, "up_bps": up_bps, "ping_ms": ping_ms, "src": "ookla*", "iface": host_iface}
+                        else:
+                            errors.append(f"ookla(no-iface): rc={cp2.returncode} err={ (cp2.stderr or cp2.stdout or '').strip() }")
+                except Exception as e_ook:
+                    errors.append(f"ookla: {e_ook}")
+            else:
+                errors.append("ookla: 'speedtest' not found or not Ookla CLI")
 
-            raise RuntimeError(f"No speedtest backend available or network/DNS issue on {host_iface}")
+            raise RuntimeError("No speedtest backend available or all failed. " + "; ".join(errors[:3]))
 
         def _done(result, err):
             hide_busy_indicator()
@@ -1050,11 +1141,16 @@ class InfoScreen(Screen):
             if err:
                 show_message("Speed Test", str(err), is_error=True, position='center')
                 self.speed_value.text = "Failed"
+                log.debug("Speed test error: %s", err)
                 return
-            def fmt_pair(down_bps, up_bps):
-                return f"{(down_bps or 0)/1e6:.2f}↓ / {(up_bps or 0)/1e6:.2f}↑ Mbps"
+
+            iface = result.get('iface', '?')
+            src = result.get('src', '?')
             ping = f"{result.get('ping_ms', 0):.0f} ms" if result.get('ping_ms') is not None else "N/A"
-            self.speed_value.text = f"[{result.get('iface','?')}/{result.get('src','?')}] {ping}, {fmt_pair(result.get('down_bps'), result.get('up_bps'))}"
+            down = f"{(result.get('down_bps') or 0)/1e6:.2f}"
+            up = f"{(result.get('up_bps') or 0)/1e6:.2f}"
+            # Two-line display
+            self.speed_value.text = f"[{iface}/{src}] {ping}\n{down}↓ / {up}↑ Mbps"
 
         run_bg(_task, _done)
 
@@ -1139,8 +1235,8 @@ class WifiScreen(Screen):
         self.current_lbl.text = f"Current: {ssid or '—'}"
 
     def _add_info_row(self, text):
-        lbl = Label(text=text, font_size=THEME.FONT_SIZE_NORMAL, color=THEME.TEXT_COLOR_DARK,
-                    halign='left', valign='middle', size_hint_y=None, height=34)
+        lbl = Label(text=text, font_size=THEME.FONT_SIZE_SMALL, color=THEME.TEXT_COLOR_DARK,
+                    halign='left', valign='middle', size_hint_y=None, height=24)
         lbl.bind(size=lbl.setter('text_size'))
         self.list_grid.add_widget(lbl)
 
@@ -1323,42 +1419,60 @@ class VpnScreen(Screen):
 
     def toggle_vpn(self, vpn_file, display_name, *args):
         show_busy_indicator()
+        connect_timeout = CONFIG.get("vpn_connect_timeout", 40)
+
         def _task():
+            # Stop any existing VPN
             run_cmd(["sudo", "killall", "openvpn"])
+            # Start requested VPN
             config_path = OVPN_DIR / vpn_file
             if not config_path.exists():
                 raise FileNotFoundError(str(config_path))
-            # No shell: pass argv list to avoid quoting issues
             run_cmd(["sudo", "openvpn", "--daemon", "--config", str(config_path)])
-            return True
+            # Wait until actually up (tun/tap has an IPv4), or fail
+            iface, ip = _wait_for_vpn_up(timeout=connect_timeout)
+            return {"iface": iface, "ip": ip}
+
         def _done(result, err):
             hide_busy_indicator()
             if err:
-                show_message("Error", f"Failed to start VPN:\n{vpn_file}", is_error=True)
-            else:
-                STATE.vpn_name = display_name
-                STATE.vpn_status = "ON"
-                STATE.update_geoip_async()
-                if self.manager:
-                    self.manager.current = "main"
+                show_message("VPN", f"Connect failed: {err}", is_error=True)
+                log.error("VPN connect error for %s: %s", display_name, err)
+                return
+            STATE.vpn_name = display_name
+            STATE.vpn_status = "ON"
+            STATE.update_geoip_async()
+            STATE.update_async()
+            if self.manager:
+                self.manager.current = "main"
+
         run_bg(_task, _done)
 
     def disconnect_vpn(self, *args):
         show_busy_indicator()
+        disconnect_timeout = CONFIG.get("vpn_disconnect_timeout", 15)
+
         def _task():
             run_cmd(["sudo", "killall", "openvpn"])
+            _wait_for_vpn_down(timeout=disconnect_timeout)
             return True
+
         def _done(result, err):
             hide_busy_indicator()
+            if err:
+                show_message("VPN", f"Disconnect failed: {err}", is_error=True)
+                log.error("VPN disconnect error: %s", err)
+                return
             STATE.vpn_name = "None"
             STATE.vpn_status = "OFF"
             self.populate_vpn_buttons()
-            Clock.schedule_once(lambda dt: self.finish_vpn_action(), 0.8)
-        run_bg(_task, _done)
+            STATE.update_async()
+            STATE.update_geoip_async()
+            show_message("VPN", "Disconnected", duration=1.2)
+            if self.manager:
+                self.manager.current = "main"
 
-    def finish_vpn_action(self):
-        STATE.update_async()
-        STATE.update_geoip_async()
+        run_bg(_task, _done)
 
 
 # ------------------------------------------------------------
